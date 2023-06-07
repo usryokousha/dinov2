@@ -12,15 +12,13 @@ import torch
 from torch import nn
 
 from dinov2.loss import DINOLoss, iBOTPatchLoss, KoLeoLoss
-from dinov2.models import build_model_from_cfg, build_model
+from dinov2.models import build_model
 from dinov2.layers import DINOHead
 from dinov2.utils.utils import has_batchnorms
 from dinov2.utils.param_groups import get_params_groups_with_decay, fuse_params_groups
 from dinov2.fsdp import get_fsdp_wrapper, ShardedGradScaler, get_fsdp_modules, reshard_fsdp_model
 
 from dinov2.models.vision_transformer import BlockChunk
-
-from timm.utils import ModelEmaV2
 
 try:
     from xformers.ops import fmha
@@ -43,25 +41,17 @@ class DistillMetaArch(nn.Module):
         student_model_dict = dict()
         teacher_model_dict = dict()
 
-        student_backbone, student_embed_dim = build_model(cfg.student, only_teacher=False, img_size=cfg.crops.global_crops_size)
+        student_backbone, student_embed_dim = build_model(cfg.student, only_teacher=True, img_size=cfg.crops.global_crops_size)
         teacher_backbone, teacher_embed_dim = build_model(cfg.teacher, only_teacher=True, img_size=cfg.crops.global_crops_size)
-
-        assert student_embed_dim == teacher_embed_dim, "student and teacher must have the same embedding dimension"
-        embed_dim = student_embed_dim
-        
         student_model_dict["backbone"] = student_backbone
         teacher_model_dict["backbone"] = teacher_backbone
-        
-        logger.info(f"OPTIONS -- architecture : embed_dim: {embed_dim}")
-        
-        if cfg.teacher.pretrained_weights is None:
-            raise ValueError("Teacher model must be pretrained.")
-        
-        chkpt = torch.load(cfg.teacher.pretrained_weights)
-        logger.info(f"OPTIONS -- pretrained weights: loading from {cfg.teacher.pretrained_weights}")
-        teacher_backbone.load_state_dict(chkpt["model"], strict=False)
 
-        self.embed_dim = embed_dim
+        # Student and teacher embedding dimensions can be different and therefore DINO head and IBOT heads should be different
+        logger.info(f"OPTIONS -- architecture : student_embed_dim: {student_embed_dim}")
+        logger.info(f"OPTIONS -- architecture : teacher_embed_dim: {teacher_embed_dim}")
+
+        self.student_embed_dim = student_embed_dim
+        self.teacher_embed_dim = teacher_embed_dim
         self.dino_out_dim = cfg.dino.head_n_prototypes
 
         self.do_dino = cfg.dino.loss_weight > 0
@@ -78,12 +68,12 @@ class DistillMetaArch(nn.Module):
             self.dino_loss_weight = cfg.dino.loss_weight
             dino_head = partial(
                 DINOHead,
-                in_dim=embed_dim,
                 out_dim=cfg.dino.head_n_prototypes,
                 hidden_dim=cfg.dino.head_hidden_dim,
                 bottleneck_dim=cfg.dino.head_bottleneck_dim,
                 nlayers=cfg.dino.head_nlayers,
             )
+                
             self.dino_loss = DINOLoss(self.dino_out_dim)
             if self.do_koleo:
                 logger.info("OPTIONS -- DINO -- applying KOLEO regularization")
@@ -93,8 +83,8 @@ class DistillMetaArch(nn.Module):
             logger.info("OPTIONS -- DINO -- not using DINO")
 
         if self.do_dino or self.do_ibot:
-            student_model_dict["dino_head"] = dino_head()
-            teacher_model_dict["dino_head"] = dino_head()
+            student_model_dict["dino_head"] = dino_head(in_dim=student_embed_dim)
+            teacher_model_dict["dino_head"] = dino_head(in_dim=teacher_embed_dim)
 
         logger.info("OPTIONS -- IBOT")
         logger.info(f"OPTIONS -- IBOT -- loss_weight: {cfg.ibot.loss_weight}")
@@ -113,29 +103,37 @@ class DistillMetaArch(nn.Module):
                 logger.info(f"OPTIONS -- IBOT -- head_hidden_dim: {cfg.ibot.head_hidden_dim}")
                 ibot_head = partial(
                     DINOHead,
-                    in_dim=embed_dim,
                     out_dim=cfg.ibot.head_n_prototypes,
                     hidden_dim=cfg.ibot.head_hidden_dim,
                     bottleneck_dim=cfg.ibot.head_bottleneck_dim,
                     nlayers=cfg.ibot.head_nlayers,
                 )
-                student_model_dict["ibot_head"] = ibot_head()
-                teacher_model_dict["ibot_head"] = ibot_head()
+                student_model_dict["ibot_head"] = ibot_head(in_dim=student_embed_dim)
+                teacher_model_dict["ibot_head"] = ibot_head(in_dim=teacher_embed_dim)
             else:
                 logger.info("OPTIONS -- IBOT -- head shared with DINO")
 
-        self.need_to_synchronize_fsdp_streams = True
+        # self.need_to_synchronize_fsdp_streams = True
 
         self.student = nn.ModuleDict(student_model_dict)
         self.teacher = nn.ModuleDict(teacher_model_dict)
+        self.student_shadow = copy.deepcopy(self.student)
 
-        # student needs to update a moving average of student weights
-        self.student_shadow = copy.deepcopy(self.student).eval()
+        assert cfg.teacher.pretrained_weights is not None, "Must contain pretrained weights for distillation."
+        chkpt = torch.load(cfg.teacher.pretrained_weights)
+        logger.info(f"OPTIONS -- pretrained weights: loading from {cfg.teacher.pretrained_weights}")
+        self.teacher.load_state_dict(chkpt["model"], strict=False)
 
         # there is no backpropagation through the teacher, so no need for gradients
         for p in self.teacher.parameters():
             p.requires_grad = False
-        logger.info(f"Student and Teacher are built: they are both {cfg.student.arch} network.")
+
+        # there is no backpropagation through the shadow copy either
+        for p in self.student_shadow.parameters():
+            p.requires_grad = False
+        
+        logger.info(f"Student is built: it is using {cfg.student.arch}")
+        logger.info(f"Teacher is built: it is using {cfg.teacher.arch}")
 
     def forward(self, inputs):
         raise NotImplementedError
@@ -358,32 +356,44 @@ class DistillMetaArch(nn.Module):
 
         self.backprop_loss(loss_accumulator)
 
-        self.fsdp_synchronize_streams()
+        # self.fsdp_synchronize_streams()
 
         return loss_dict
 
-    def fsdp_synchronize_streams(self):
-        if self.need_to_synchronize_fsdp_streams:
-            torch.cuda.synchronize()
-            self.student.dino_head._streams = (
-                self.teacher.dino_head._streams
-            ) = self.student.backbone._streams = self.teacher.backbone._streams
-            self.need_to_synchronize_fsdp_streams = False
+    # def fsdp_synchronize_streams(self):
+    #     if self.need_to_synchronize_fsdp_streams:
+    #         torch.cuda.synchronize()
+    #         self.student.dino_head._streams = (
+    #             self.teacher.dino_head._streams
+    #         ) = self.student.backbone._streams = self.teacher.backbone._streams
+    #         self.need_to_synchronize_fsdp_streams = False
+
+    # def update_teacher(self, m):
+    #     student_param_list = []
+    #     teacher_param_list = []
+    #     with torch.no_grad():
+    #         for k in self.student.keys():
+    #             for ms, mt in zip(get_fsdp_modules(self.student[k]), get_fsdp_modules(self.teacher[k])):
+    #                 student_param_list += ms.params
+    #                 teacher_param_list += mt.params
+    #         torch._foreach_mul_(teacher_param_list, m)
+    #         torch._foreach_add_(teacher_param_list, student_param_list, alpha=1 - m)
 
     def update_student_shadow(self, m):
         student_param_list = []
         student_shadow_param_list = []
         with torch.no_grad():
             for k in self.student.keys():
-                for ms, mse in zip(get_fsdp_modules(self.student[k]), get_fsdp_modules(self.student_shadow[k])):
+                for ms, mss in zip(get_fsdp_modules(self.student[k]), get_fsdp_modules(self.student_shadow[k])):
                     student_param_list += ms.params
-                    student_shadow_param_list += mse.params
+                    student_shadow_param_list += mss.params
             torch._foreach_mul_(student_shadow_param_list, m)
             torch._foreach_add_(student_shadow_param_list, student_param_list, alpha=1 - m)
 
     def train(self):
         super().train()
         self.teacher.eval()
+        self.student_shadow.eval()
 
     def get_maybe_fused_params_for_submodel(self, m):
         params_groups = get_params_groups_with_decay(
@@ -408,12 +418,14 @@ class DistillMetaArch(nn.Module):
         logger.info("DISTRIBUTED FSDP -- preparing model for distributed training")
         if has_batchnorms(self.student):
             raise NotImplementedError
+        
         # below will synchronize all student subnetworks across gpus:
         for k, v in self.student.items():
+            self.student_shadow[k].load_state_dict(self.student[k].state_dict())
+            # self.teacher[k].load_state_dict(self.student[k].state_dict())
             student_model_cfg = self.cfg.compute_precision.student[k]
             self.student[k] = get_fsdp_wrapper(student_model_cfg, modules_to_wrap={BlockChunk})(self.student[k])
 
-        # below will synchronize all teacher subnetworks across gpus:
         for k, v in self.teacher.items():
             teacher_model_cfg = self.cfg.compute_precision.teacher[k]
             self.teacher[k] = get_fsdp_wrapper(teacher_model_cfg, modules_to_wrap={BlockChunk})(self.teacher[k])
