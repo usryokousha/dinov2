@@ -41,8 +41,8 @@ class DistillMetaArch(nn.Module):
         student_model_dict = dict()
         teacher_model_dict = dict()
 
-        student_backbone, student_embed_dim = build_model(cfg.student, only_teacher=True, img_size=cfg.crops.global_crops_size)
-        teacher_backbone, teacher_embed_dim = build_model(cfg.teacher, only_teacher=True, img_size=cfg.crops.global_crops_size)
+        student_backbone, student_embed_dim = build_model(cfg.student, only_teacher=True, img_size=cfg.crops.global_crops_size) # pyright: ignore
+        teacher_backbone, teacher_embed_dim = build_model(cfg.teacher, only_teacher=True, img_size=cfg.crops.global_crops_size) # pyright: ignore
         student_model_dict["backbone"] = student_backbone
         teacher_model_dict["backbone"] = teacher_backbone
 
@@ -83,8 +83,8 @@ class DistillMetaArch(nn.Module):
             logger.info("OPTIONS -- DINO -- not using DINO")
 
         if self.do_dino or self.do_ibot:
-            student_model_dict["dino_head"] = dino_head(in_dim=student_embed_dim)
-            teacher_model_dict["dino_head"] = dino_head(in_dim=teacher_embed_dim)
+            student_model_dict["dino_head"] = dino_head(in_dim=student_embed_dim) # pyright: ignore
+            teacher_model_dict["dino_head"] = dino_head(in_dim=teacher_embed_dim) # pyright: ignore
 
         logger.info("OPTIONS -- IBOT")
         logger.info(f"OPTIONS -- IBOT -- loss_weight: {cfg.ibot.loss_weight}")
@@ -140,7 +140,7 @@ class DistillMetaArch(nn.Module):
 
     def backprop_loss(self, loss):
         if self.fp16_scaler is not None:
-            self.fp16_scaler.scale(loss).backward()
+            self.fp16_scaler.scale(loss).backward() # pyright: ignore
         else:
             loss.backward()
 
@@ -172,7 +172,7 @@ class DistillMetaArch(nn.Module):
         @torch.no_grad()
         def get_teacher_output():
             x, n_global_crops_teacher = global_crops, n_global_crops
-            teacher_backbone_output_dict = self.teacher.backbone(x, is_training=True)
+            teacher_backbone_output_dict = self.teacher.backbone(x, is_training=True) # pyright: ignore
             teacher_cls_tokens = teacher_backbone_output_dict["x_norm_clstoken"]
             teacher_cls_tokens = teacher_cls_tokens.chunk(n_global_crops_teacher)
             # watch out: these are chunked and cat'd in reverse so A is matched to B in the global crops dino loss
