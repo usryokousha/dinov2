@@ -39,11 +39,14 @@ class DistillMetaArch(nn.Module):
         self.fp16_scaler = ShardedGradScaler() if cfg.compute_precision.grad_scaler else None
 
         student_model_dict = dict()
+        student_shadow_model_dict = dict()
         teacher_model_dict = dict()
 
         student_backbone, student_embed_dim = build_model(cfg.student, only_teacher=True, img_size=cfg.crops.global_crops_size) # pyright: ignore
+        student_shadow_backbone, student_shadow_embed_dim = build_model(cfg.student, only_teacher=True, img_size=cfg.crops.global_crops_size)  # pyright: ignore
         teacher_backbone, teacher_embed_dim = build_model(cfg.teacher, only_teacher=True, img_size=cfg.crops.global_crops_size) # pyright: ignore
         student_model_dict["backbone"] = student_backbone
+        student_shadow_model_dict["backbone"] = student_shadow_backbone
         teacher_model_dict["backbone"] = teacher_backbone
 
         # Student and teacher embedding dimensions can be different and therefore DINO head and IBOT heads should be different
@@ -84,6 +87,7 @@ class DistillMetaArch(nn.Module):
 
         if self.do_dino or self.do_ibot:
             student_model_dict["dino_head"] = dino_head(in_dim=student_embed_dim) # pyright: ignore
+            student_shadow_model_dict["dino_head"] = dino_head(in_dim=student_shadow_embed_dim)  # pyright: ignore
             teacher_model_dict["dino_head"] = dino_head(in_dim=teacher_embed_dim) # pyright: ignore
 
         logger.info("OPTIONS -- IBOT")
@@ -109,6 +113,7 @@ class DistillMetaArch(nn.Module):
                     nlayers=cfg.ibot.head_nlayers,
                 )
                 student_model_dict["ibot_head"] = ibot_head(in_dim=student_embed_dim)
+                student_shadow_model_dict["ibot_head"] = ibot_head(in_dim=student_shadow_embed_dim)
                 teacher_model_dict["ibot_head"] = ibot_head(in_dim=teacher_embed_dim)
             else:
                 logger.info("OPTIONS -- IBOT -- head shared with DINO")
@@ -117,7 +122,7 @@ class DistillMetaArch(nn.Module):
 
         self.student = nn.ModuleDict(student_model_dict)
         self.teacher = nn.ModuleDict(teacher_model_dict)
-        self.student_shadow = copy.deepcopy(self.student)
+        self.student_shadow = nn.ModuleDict(student_shadow_model_dict)
 
         assert cfg.teacher.pretrained_weights is not None, "Must contain pretrained weights for distillation."
         chkpt = torch.load(cfg.teacher.pretrained_weights)
@@ -425,6 +430,7 @@ class DistillMetaArch(nn.Module):
             # self.teacher[k].load_state_dict(self.student[k].state_dict())
             student_model_cfg = self.cfg.compute_precision.student[k]
             self.student[k] = get_fsdp_wrapper(student_model_cfg, modules_to_wrap={BlockChunk})(self.student[k])
+            self.student_shadow[k] = get_fsdp_wrapper(student_model_cfg, modules_to_wrap={BlockChunk})(self.student_shadow[k])
 
         for k, v in self.teacher.items():
             teacher_model_cfg = self.cfg.compute_precision.teacher[k]
